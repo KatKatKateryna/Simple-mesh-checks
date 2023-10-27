@@ -1,112 +1,127 @@
-"""This module contains the business logic for a Speckle Automate function.
+"""This module contains the business logic of the function.
 
-The purpose is to demonstrate how one can use the automation_context module
-to process and analyze data in a Speckle project.
+use the automation_context module to wrap your function in an Automate context helper
 """
+from typing import cast, List, Dict
+
 from pydantic import Field
 from speckle_automate import (
     AutomateBase,
     AutomationContext,
     execute_automate_function,
 )
+from specklepy.objects import Base
 
-from Objects.objects import (
-    attach_visual_markers,
-    colorise_densities,
-    create_health_objects,
-    density_summary,
-)
-from Utilities.utilities import Utilities
-
-## new render materials for objects passing/failing
-## swap those into the original commit object
-## send that back to the server
+from Rules.actions import PrefixRemovalAction
+from Rules.rules import ParameterRules
+from Rules.traversal import get_data_traversal_rules
 
 
 class FunctionInputs(AutomateBase):
-    """Definition of user inputs for this function.
+    """These are function author defined values.
 
-    These fields define the parameters that users can adjust when triggering
-    this function in the Speckle web application.
+    Automate will make sure to supply them matching the types specified here.
+    Please use the pydantic model schema to define your inputs:
+    https://docs.pydantic.dev/latest/usage/models/
     """
 
-    density_level: float = Field(
-        title="Density Threshold",
+    forbidden_parameter_prefix: str = Field(
+        title="Parameter Prefix to Cleanse",
         description=(
-            "Set a density value as the threshold. Objects with "
-            "densities exceeding this value will be highlighted."
+            "If a object has a parameter with the following prefix it will be removed from the object."
         ),
-    )
-    max_percentage_high_density_objects: float = Field(
-        title="High Density Object Limit (%)",
-        description=(
-            "Specify the maximum percentage (0-1) of objects you're "
-            "willing to allow above the set density threshold. "
-            "For instance, a value of 0.1 means you'll tolerate up "
-            "to 10% of the objects having a density above the threshold."
-        ),
-        ge=0.0,
-        le=1.0,
     )
 
 
 def automate_function(
-    automate_context: AutomationContext, function_inputs: FunctionInputs
+    automate_context: AutomationContext,
+    function_inputs: FunctionInputs,
 ) -> None:
-    """Analyzes Speckle data and provides visual markers and notifications.
+    """
+    Main function for the Speckle Automation.
 
-    Fetches the specified version of the Speckle project, evaluates its objects
-    based on their density, and reports results visually and as notifications.
+    This function receives the Speckle data, applies a series of checks
+    and actions on it, and then reports the results.
 
     Args:
-        automate_context (AutomationContext): Context for the current run,
-            providing methods to fetch project data and send results.
-        function_inputs (FunctionInputs): User-defined parameters guiding
-            the analysis.
+        automate_context: Context with helper methods for Speckle Automate.
+        function_inputs: User-defined inputs for the automation.
     """
-    # Fetch the root object of the specified Speckle project version.
-    version_root_object = automate_context.receive_version()
-
-    # Filter out objects to keep only displayable ones with valid IDs.
-    displayable_bases = Utilities.filter_displayable_bases(version_root_object)
-
-    if not displayable_bases:
-        automate_context.mark_run_failed("No displayable mesh objects found.")
+    if not function_inputs.forbidden_parameter_prefix:
+        automate_context.mark_run_failed("No prefix has been set.")
         return
 
-    # Transform filtered objects to health objects for density analysis.
-    health_objects = create_health_objects(displayable_bases)
+    version_root_object = automate_context.receive_version()
 
-    # Wrap up the analysis by marking the run either successful or failed.
-    pass_rate_percentage = function_inputs.max_percentage_high_density_objects
-    threshold = function_inputs.density_level
-    
-    commit_details = {
-        "stream_id": automate_context.automation_run_data.project_id,
-        "commit_id": automate_context.automation_run_data.version_id,
-        "server_url": automate_context.automation_run_data.speckle_server_url,
-    }
+    # Traverse the received Speckle data.
+    speckle_data = get_data_traversal_rules()
+    traversal_contexts_collection = speckle_data.traverse(version_root_object)
 
-    # Calculate the percentage of objects above the threshold   
-    high_density_count = sum(1 for ho in health_objects.values() if ho.aggregate_density > threshold) #summary_data["values"]["fail_count"]
-    above_threshold_percentage = high_density_count / len(health_objects)
+    # Checking rules
+    is_revit_parameter = ParameterRules.speckle_type_rule(
+        "Objects.BuiltElements.Revit.Parameter"
+    )
+    has_forbidden_prefix = ParameterRules.forbidden_prefix_rule(
+        function_inputs.forbidden_parameter_prefix
+    )
 
-    # Determine if the result is a pass or fail
-    result_state = ("Pass" if above_threshold_percentage <= pass_rate_percentage else "Fail")
-    total_displayable_count = len(displayable_bases)
+    # Actions
+    removal_action = PrefixRemovalAction(function_inputs.forbidden_parameter_prefix)
 
-    if result_state == "Fail":
-        automate_context.mark_run_failed(
-            f"Too many high-density objects. Allowed: "
-            f"{pass_rate_percentage * 100}%, Found: "
-            f"{(high_density_count / total_displayable_count) * 100}%."
-        )
-    else:
-        automate_context.mark_run_success(
-            "Analysis complete. High-density objects within acceptable limits."
-        )
+    cleansed_objects = set()
+
+    # Iterate over each context in the traversal contexts collection.
+    # Each context represents an object (or a nested part of an object) within
+    # the data structure that was traversed.
+    # The goal of this loop is to identify and act upon parameters of the objects
+    # that meet certain criteria (e.g., being a Revit parameter with a forbidden prefix).
+    for context in traversal_contexts_collection:
+        current_object = context.current
+        if hasattr(current_object, "parameters"):
+            parameters = cast(Base, current_object.parameters)
+
+            if parameters is None:
+                continue
+
+            for parameter_key in parameters.get_dynamic_member_names():
+                parameter = cast(Base, parameters.__getitem__(f"{parameter_key}"))
+
+                if is_revit_parameter(parameter) and has_forbidden_prefix(parameter):
+                    removal_action.apply(parameter, current_object)
+                    if current_object.id not in cleansed_objects:
+                        cleansed_objects.add(current_object.id)
+
+    # check the affected objects of all actions and count them
+    affected_objects = set()
+    for action in [removal_action]:
+        affected_objects.update(action.affected_parameters)
+
+    if not affected_objects or len(affected_objects) == 0:
+        automate_context.mark_run_success("No parameters were removed.")
+        return
+
+    # Generate reports for all actions.
+    for action in [removal_action]:
+        action.report(automate_context)
+
+    new_version_id = automate_context.create_new_version_in_project(
+        version_root_object, "cleansed", "Cleansed Parameters"
+    )
+
+    if not new_version_id:
+        automate_context.mark_run_failed("Failed to create a new version.")
+        return
+
+    # Final summary.
+    automate_context.mark_run_success("Actions applied and reports generated.")
 
 
+# make sure to call the function with the executor
 if __name__ == "__main__":
-    # Entry point: Execute the automate function with defined inputs.
+    # NOTE: always pass in the automate function by its reference, do not invoke it!
+
+    # pass in the function reference with the inputs schema to the executor
     execute_automate_function(automate_function, FunctionInputs)
+
+    # if the function has no arguments, the executor can handle it like so
+    # execute_automate_function(automate_function_without_inputs)
