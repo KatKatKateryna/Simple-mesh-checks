@@ -54,6 +54,4 @@ def test_real_data(test_version_object: Any, speckle_server_url: str):
     Test your code against a real Speckle commit.
     """
 
-    assert isinstance(Base, test_version_object)
-
-    pass
+    assert isinstance(test_version_object, Base)
