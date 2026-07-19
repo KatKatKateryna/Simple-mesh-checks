@@ -103,7 +103,7 @@ def fake_automation_run_data(request, test_client: SpeckleClient) -> AutomationR
     project_id = "d96e3f2579"
     model_id = "08e5d7037a"
 
-    function_name = "Automate Density Check"
+    function_name = "Automate Forbidden Prefix Removal"
 
     automation_id = crypto_random_string(10)
     automation_name = "Local Test Automation"
