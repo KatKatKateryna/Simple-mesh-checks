@@ -103,7 +103,7 @@ def fake_automation_run_data(request, test_client: SpeckleClient) -> AutomationR
     project_id = "d96e3f2579"
     model_id = "08e5d7037a"
 
-    function_name = "Automate Density Check"
+    function_name = "Automate Forbidden Prefix Removal"
 
     automation_id = crypto_random_string(10)
     automation_name = "Local Test Automation"
@@ -141,10 +141,11 @@ def test_function_run(fake_automation_run_data: AutomationRunData, speckle_token
     """Run an integration test for the automate function."""
     context = AutomationContext.initialize(fake_automation_run_data, speckle_token)
 
+    # empty prefix should hit the "no prefix has been set" failure path in automate_function
     automate_sdk = run_function(
         context,
         automate_function,
-        FunctionInputs(density_level=1000, max_percentage_high_density_objects=0.1),
+        FunctionInputs(forbidden_parameter_prefix=""),
     )
 
     assert automate_sdk.run_status == AutomationStatus.FAILED
